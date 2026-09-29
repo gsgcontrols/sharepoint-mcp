@@ -7,7 +7,7 @@ Microsoft Graph *as that user*. Claude can only reach what the user already can.
 import asyncio
 import os
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import httpx
 import jwt
@@ -17,6 +17,8 @@ from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import FastMCP
 from pydantic import AnyHttpUrl
+from starlette.requests import Request
+from starlette.responses import JSONResponse, RedirectResponse, Response
 
 TENANT_ID = os.environ["TENANT_ID"]
 CLIENT_ID = os.environ["CLIENT_ID"]
@@ -76,7 +78,9 @@ mcp = FastMCP(
     stateless_http=True,
     token_verifier=EntraTokenVerifier(),
     auth=AuthSettings(
-        issuer_url=AnyHttpUrl(ISSUER),
+        # This server fronts Entra's sign-in (see "OAuth proxy" below), so it is
+        # the authorization server Claude talks to.
+        issuer_url=AnyHttpUrl(PUBLIC_URL),
         resource_server_url=AnyHttpUrl(f"{PUBLIC_URL}/mcp"),
         required_scopes=[API_SCOPE],
     ),
@@ -184,6 +188,61 @@ async def list_pages(site_id: str) -> list[dict]:
         {"id": p.get("id"), "name": p.get("name"), "title": p.get("title"), "webUrl": p.get("webUrl")}
         for p in data.get("value", [])
     ]
+
+
+# ---------------------------------------------------------------- OAuth proxy
+# Claude sends the RFC 8707 "resource" parameter, which Entra rejects alongside
+# our api:// scope (AADSTS9010010). These endpoints forward Claude's sign-in
+# requests to Entra unchanged except for dropping "resource" and filling in
+# scopes Entra needs. Tokens still come from Entra and are verified above.
+
+ENTRA_AUTHORIZE = f"{AUTHORITY}/oauth2/v2.0/authorize"
+ENTRA_TOKEN = f"{AUTHORITY}/oauth2/v2.0/token"
+DEFAULT_SCOPE = f"{API_SCOPE} offline_access"
+
+
+def _with_scope(scope: str | None) -> str:
+    parts = (scope or "").split()
+    for needed in (API_SCOPE, "offline_access"):
+        if needed not in parts:
+            parts.append(needed)
+    return " ".join(parts)
+
+
+@mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])
+@mcp.custom_route("/.well-known/openid-configuration", methods=["GET"])
+async def as_metadata(request: Request) -> Response:
+    issuer = str(AnyHttpUrl(PUBLIC_URL))  # same string the resource metadata advertises
+    return JSONResponse({
+        "issuer": issuer,
+        "authorization_endpoint": f"{PUBLIC_URL}/authorize",
+        "token_endpoint": f"{PUBLIC_URL}/token",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
+        "code_challenge_methods_supported": ["S256"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+        "scopes_supported": [API_SCOPE, "offline_access"],
+    })
+
+
+@mcp.custom_route("/authorize", methods=["GET"])
+async def authorize(request: Request) -> Response:
+    params = {k: v for k, v in request.query_params.items() if k != "resource"}
+    params["scope"] = _with_scope(params.get("scope"))
+    return RedirectResponse(f"{ENTRA_AUTHORIZE}?{urlencode(params)}", status_code=302)
+
+
+@mcp.custom_route("/token", methods=["POST"])
+async def token(request: Request) -> Response:
+    form = {k: v for k, v in (await request.form()).items() if k != "resource"}
+    form["scope"] = _with_scope(form.get("scope"))
+    headers = {}
+    if "authorization" in request.headers:  # client_secret_basic
+        headers["Authorization"] = request.headers["authorization"]
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(ENTRA_TOKEN, data=form, headers=headers)
+    return Response(r.content, status_code=r.status_code,
+                    media_type=r.headers.get("content-type", "application/json"))
 
 
 if __name__ == "__main__":
